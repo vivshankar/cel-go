@@ -1,4 +1,4 @@
-module github.com/google/cel-go
+module github.com/vivshankar/cel-go
 
 go 1.12
 
