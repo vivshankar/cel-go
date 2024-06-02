@@ -194,8 +194,8 @@ func (m *baseMap) Contains(index ref.Val) ref.Val {
 
 // ConvertToNative implements the ref.Val interface method.
 func (m *baseMap) ConvertToNative(typeDesc reflect.Type) (interface{}, error) {
-	if initializer, ok := m.mapAccessor.(mapInitializer); ok && !initializer.IsInitialized() {
-		m.value, _ = initializer.Initialize()
+	if m.IsInitialized() {
+		m.value, m.size = m.Initialize()
 	}
 
 	// If the map is already assignable to the desired type return it, e.g. interfaces and
@@ -337,8 +337,8 @@ func (m *baseMap) Get(key ref.Val) ref.Val {
 
 // Size implements the traits.Sizer interface method.
 func (m *baseMap) Size() ref.Val {
-	if initializer, ok := m.mapAccessor.(mapInitializer); ok && !initializer.IsInitialized() {
-		m.value, m.size = initializer.Initialize()
+	if m.IsInitialized() {
+		m.value, m.size = m.Initialize()
 	}
 
 	return Int(m.size)
@@ -351,8 +351,8 @@ func (m *baseMap) Type() ref.Type {
 
 // Value implements the ref.Val interface method.
 func (m *baseMap) Value() interface{} {
-	if initializer, ok := m.mapAccessor.(mapInitializer); ok && !initializer.IsInitialized() {
-		m.value, m.size = initializer.Initialize()
+	if m.IsInitialized() {
+		m.value, m.size = m.Initialize()
 	}
 
 	return m.value
