@@ -29,15 +29,34 @@ import (
 	structpb "google.golang.org/protobuf/types/known/structpb"
 )
 
+// MapValueLoader is a function type to load the map contents.
+type MapValueLoader func() (interface{}, int, error)
+
 // NewDynamicMap returns a traits.Mapper value with dynamic key, value pairs.
 func NewDynamicMap(adapter ref.TypeAdapter, value interface{}) traits.Mapper {
 	refValue := reflect.ValueOf(value)
 	return &baseMap{
 		TypeAdapter: adapter,
-		mapAccessor: newReflectMapAccessor(adapter, refValue),
+		mapAccessor: newReflectMapAccessor(adapter, refValue, nil),
 		value:       value,
 		size:        refValue.Len(),
 	}
+}
+
+// NewDynamicMapWithInitializer returns a traits.Mapper value with dynamic key, value pairs and an initializer function
+// that loads the contents of the map on first use.
+func NewDynamicMapWithInitializer(adapter ref.TypeAdapter, value interface{}, mapValueLoader MapValueLoader) traits.Mapper {
+	bm := &baseMap{
+		TypeAdapter:    adapter,
+		mapAccessor:    nil,
+		value:          value,
+		size:           0,
+		mapValueLoader: mapValueLoader,
+	}
+
+	bm.mapAccessor = newReflectMapAccessor(adapter, reflect.ValueOf(value), bm)
+
+	return bm
 }
 
 // NewJSONStruct creates a traits.Mapper implementation backed by a JSON struct that has been
@@ -114,6 +133,18 @@ type mapAccessor interface {
 	Iterator() traits.Iterator
 }
 
+// mapInitializer is a private interface to initialize map contents when the map is used
+// for the first time.
+type mapInitializer interface {
+	// Initialize loads the data into the map. It is expected to only be called
+	// once in the lifecycle of the Map instance.
+	// The function returns the value and the size.
+	Initialize() (interface{}, int)
+
+	// IsInitialized indicates if the initializer has already been called.
+	IsInitialized() bool
+}
+
 // baseMap is a reflection based map implementation designed to handle a variety of map-like types.
 //
 // Since CEL is side-effect free, the base map represents an immutable object.
@@ -129,6 +160,30 @@ type baseMap struct {
 
 	// size is the number of entries in the map.
 	size int
+
+	// mapValueLoader is the function that is used to lazy-load the map value
+	mapValueLoader MapValueLoader
+
+	// initialized indicates if the map value has been loaded
+	initialized bool
+}
+
+// Initialize loads the data into the map. It is expected to only be called
+// once in the lifecycle of the Map instance.
+// The function returns the value, the size and an error, if it encounters any issues.
+func (m *baseMap) Initialize() (interface{}, int) {
+	if m.mapValueLoader == nil || m.initialized {
+		return m.value, m.size
+	}
+
+	m.initialized = true
+	m.value, m.size, _ = m.mapValueLoader()
+	return m.value, m.size
+}
+
+// IsInitialized indicates if the initializer has already been called.
+func (m *baseMap) IsInitialized() bool {
+	return m.initialized
 }
 
 // Contains implements the traits.Container interface method.
@@ -139,6 +194,10 @@ func (m *baseMap) Contains(index ref.Val) ref.Val {
 
 // ConvertToNative implements the ref.Val interface method.
 func (m *baseMap) ConvertToNative(typeDesc reflect.Type) (interface{}, error) {
+	if m.IsInitialized() {
+		m.value, m.size = m.Initialize()
+	}
+
 	// If the map is already assignable to the desired type return it, e.g. interfaces and
 	// maps with the same key value types.
 	if reflect.TypeOf(m.value).AssignableTo(typeDesc) {
@@ -247,6 +306,7 @@ func (m *baseMap) Equal(other ref.Val) ref.Val {
 	if !ok {
 		return False
 	}
+
 	if m.Size() != otherMap.Size() {
 		return False
 	}
@@ -277,6 +337,10 @@ func (m *baseMap) Get(key ref.Val) ref.Val {
 
 // Size implements the traits.Sizer interface method.
 func (m *baseMap) Size() ref.Val {
+	if m.IsInitialized() {
+		m.value, m.size = m.Initialize()
+	}
+
 	return Int(m.size)
 }
 
@@ -287,6 +351,10 @@ func (m *baseMap) Type() ref.Type {
 
 // Value implements the ref.Val interface method.
 func (m *baseMap) Value() interface{} {
+	if m.IsInitialized() {
+		m.value, m.size = m.Initialize()
+	}
+
 	return m.value
 }
 
@@ -333,19 +401,23 @@ func (a *jsonStructAccessor) Iterator() traits.Iterator {
 	}
 }
 
-func newReflectMapAccessor(adapter ref.TypeAdapter, value reflect.Value) mapAccessor {
+func newReflectMapAccessor(adapter ref.TypeAdapter, value reflect.Value, mapInitializer mapInitializer) mapAccessor {
 	keyType := value.Type().Key()
 	return &reflectMapAccessor{
-		TypeAdapter: adapter,
-		refValue:    value,
-		keyType:     keyType,
+		TypeAdapter:    adapter,
+		refValue:       value,
+		keyType:        keyType,
+		mapInitializer: mapInitializer,
+		initialized:    mapInitializer == nil,
 	}
 }
 
 type reflectMapAccessor struct {
 	ref.TypeAdapter
-	refValue reflect.Value
-	keyType  reflect.Type
+	refValue       reflect.Value
+	keyType        reflect.Type
+	mapInitializer mapInitializer
+	initialized    bool
 }
 
 // Find converts the input key to a native Golang type and then uses reflection to find the key,
@@ -353,6 +425,14 @@ type reflectMapAccessor struct {
 //
 // If the key is not found the function returns (nil, false).
 func (m *reflectMapAccessor) Find(key ref.Val) (ref.Val, bool) {
+	if !m.initialized && m.mapInitializer != nil {
+		// regardless of an error or not, to avoid calling initFunc again and again on failure cases,
+		// we treat this as initialized.
+		m.initialized = true
+		value, _ := m.mapInitializer.Initialize()
+		m.refValue = reflect.ValueOf(value)
+	}
+
 	if m.refValue.Len() == 0 {
 		return nil, false
 	}
@@ -400,6 +480,14 @@ func (m *reflectMapAccessor) findInternal(key ref.Val) (ref.Val, bool) {
 
 // Iterator creates a Golang reflection based traits.Iterator.
 func (m *reflectMapAccessor) Iterator() traits.Iterator {
+	if !m.initialized && m.mapInitializer != nil {
+		// regardless of an error or not, to avoid calling initFunc again and again on failure cases,
+		// we treat this as initialized.
+		m.initialized = true
+		value, _ := m.mapInitializer.Initialize()
+		m.refValue = reflect.ValueOf(value)
+	}
+
 	return &mapIterator{
 		TypeAdapter: m.TypeAdapter,
 		mapKeys:     m.refValue.MapRange(),
